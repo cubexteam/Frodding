@@ -1,0 +1,13 @@
+server-name: Frodding Server
+server-ip: 0.0.0.0
+server-port: 19132
+max-players: 20
+motd: A Frodding Server
+# Протокол в списке серверов. Меняй под версию клиентов:
+# 105=1.1.0 | 107=1.1.3 | 110=1.1.5 | 111=1.1.6 | 113=1.1.7
+# 0 = автоматически последний (113)
+motd-protocol: 110
+console:
+  debug: true
+plugins:
+  folder: plugins
