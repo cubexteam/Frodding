@@ -1,0 +1,2 @@
+# Frodding
+Frodding - core golang
