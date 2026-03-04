@@ -34,7 +34,7 @@ type Session struct {
 	Spawned      bool
 	X, Y, Z      float32
 	ViewDistance int32
-	sentChunks   map[[2]int32]bool
+	sentChunks   map[[2]int32]struct{}
 }
 
 func NewSession(srv *Server, rak *raknet.Session) *Session {
@@ -43,7 +43,7 @@ func NewSession(srv *Server, rak *raknet.Session) *Session {
 		rak:          rak,
 		UUID:         uuid.New(),
 		ViewDistance: 8,
-		sentChunks:   make(map[[2]int32]bool),
+		sentChunks:   make(map[[2]int32]struct{}),
 		Y:            64,
 	}
 }
@@ -54,20 +54,24 @@ func (s *Session) SendPacket(pk packets.IPacket) {
 }
 
 func (s *Session) sendBatch(id byte, data []byte) {
-	var payload bytes.Buffer
-	payload.WriteByte(id)
-	payload.Write(data)
-
 	var raw bytes.Buffer
-	writeVarUint32(&raw, uint32(payload.Len()))
-	raw.Write(payload.Bytes())
+	raw.Grow(1 + len(data) + 5)
+	raw.WriteByte(id)
+	raw.Write(data)
+
+	var buf bytes.Buffer
+	buf.Grow(raw.Len() + 5)
+	writeVarUint32(&buf, uint32(raw.Len()))
+	buf.Write(raw.Bytes())
 
 	var compressed bytes.Buffer
 	w, _ := zlib.NewWriterLevel(&compressed, zlib.BestSpeed)
-	w.Write(raw.Bytes())
-	w.Close()
+	_, _ = w.Write(buf.Bytes())
+	_ = w.Close()
 
-	batch := append([]byte{0xfe}, compressed.Bytes()...)
+	batch := make([]byte, 1+compressed.Len())
+	batch[0] = 0xfe
+	copy(batch[1:], compressed.Bytes())
 	s.rak.Send(batch, raknet.ReliableOrdered, 0)
 }
 
@@ -80,7 +84,6 @@ func writeVarUint32(buf *bytes.Buffer, v uint32) {
 }
 
 func (s *Session) HandlePayload(data []byte) {
-	defer func() { recover() }()
 	if len(data) == 0 || data[0] != 0xfe {
 		return
 	}
@@ -88,7 +91,7 @@ func (s *Session) HandlePayload(data []byte) {
 	if err != nil {
 		return
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	decompressed, err := io.ReadAll(r)
 	if err != nil {
 		return
@@ -100,7 +103,7 @@ func (s *Session) HandlePayload(data []byte) {
 			break
 		}
 		pkData := make([]byte, pkLen)
-		reader.Read(pkData)
+		_, _ = reader.Read(pkData)
 		s.handlePacketData(pkData)
 	}
 }
@@ -209,17 +212,13 @@ func (s *Session) startGame() {
 	sg.Generator = 1
 	sg.GameMode = 0
 	sg.Difficulty = 1
-	sg.SpawnBX = 0
 	sg.SpawnBY = 64
-	sg.SpawnBZ = 0
 	sg.AchievementsDisabled = true
 	sg.Time = 6000
 	sg.IsMultiplayer = true
 	sg.BroadcastToLAN = true
 	sg.CommandsEnabled = true
-	sg.ForceTexturePacks = false
 	sg.LevelName = s.server.cfg.ServerName
-	sg.IsTrial = false
 	sg.CurrentTick = 0
 	sg.EnchantmentSeed = 0
 	s.SendPacket(sg)
@@ -228,8 +227,6 @@ func (s *Session) startGame() {
 
 	adv := bedrock.NewAdventureSettingsPacket()
 	adv.Flags = 0x20 | 0x80
-	adv.CommandPermission = 0
-	adv.Flags2 = 0x00
 	adv.PlayerPermission = 1
 	adv.EntityID = 1
 	s.SendPacket(adv)
@@ -243,8 +240,7 @@ func (s *Session) handleChunkRadius(pk *bedrock.RequestChunkRadiusPacket) {
 	radius := pk.Radius
 	if radius > 4 {
 		radius = 4
-	}
-	if radius < 2 {
+	} else if radius < 2 {
 		radius = 2
 	}
 	s.ViewDistance = radius
@@ -258,13 +254,16 @@ func (s *Session) sendChunks() {
 	r := s.ViewDistance
 	chunkData := bedrock.BuildFlatChunk()
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	for x := cx - r; x <= cx+r; x++ {
 		for z := cz - r; z <= cz+r; z++ {
 			key := [2]int32{x, z}
-			if s.sentChunks[key] {
+			if _, sent := s.sentChunks[key]; sent {
 				continue
 			}
-			s.sentChunks[key] = true
+			s.sentChunks[key] = struct{}{}
 			s.SendPacket(bedrock.NewFullChunkDataPacket(x, z, chunkData))
 		}
 	}
@@ -293,6 +292,12 @@ func (s *Session) handleText(pk *bedrock.TextPacket) {
 	s.server.BroadcastMessage(fmt.Sprintf("<%s> %s", s.Username, msg))
 }
 
+var gameModeNames = map[int32]string{
+	0: "Survival",
+	1: "Creative",
+	2: "Adventure",
+}
+
 func (s *Session) handleCommand(cmd string) {
 	args := strings.Fields(cmd)
 	if len(args) == 0 {
@@ -308,30 +313,38 @@ func (s *Session) handleCommand(cmd string) {
 			}
 		}
 		s.SendMessage(fmt.Sprintf("§eOnline (%d/%d): %s", len(names), s.server.cfg.MaxPlayers, strings.Join(names, ", ")))
+
 	case "gm":
 		if len(args) < 2 {
 			s.SendMessage("§cUsage: /gm <0|1|2>")
 			return
 		}
-		var gm int32
-		switch args[1] {
-		case "0", "s", "survival":
-			gm = 0
-		case "1", "c", "creative":
-			gm = 1
-		case "2", "a", "adventure":
-			gm = 2
-		default:
+		gm, ok := parseGameMode(args[1])
+		if !ok {
 			s.SendMessage("§cUsage: /gm <0|1|2>")
 			return
 		}
 		s.setGameMode(gm)
+
 	case "stop":
 		s.server.BroadcastMessage("§cServer is shutting down!")
 		s.server.Shutdown()
+
 	default:
 		s.SendMessage(fmt.Sprintf("§cUnknown command: %s", args[0]))
 	}
+}
+
+func parseGameMode(s string) (int32, bool) {
+	switch s {
+	case "0", "s", "survival":
+		return 0, true
+	case "1", "c", "creative":
+		return 1, true
+	case "2", "a", "adventure":
+		return 2, true
+	}
+	return 0, false
 }
 
 func (s *Session) setGameMode(gm int32) {
@@ -342,14 +355,12 @@ func (s *Session) setGameMode(gm int32) {
 		adv.Flags2 = 0x40
 	} else {
 		adv.Flags = 0x20
-		adv.Flags2 = 0x00
 	}
-	adv.CommandPermission = 0
 	adv.PlayerPermission = 1
 	adv.EntityID = 1
 	s.SendPacket(adv)
-	names := map[int32]string{0: "Survival", 1: "Creative", 2: "Adventure"}
-	s.SendMessage(fmt.Sprintf("§aGame mode set to %s", names[gm]))
+	name := gameModeNames[gm]
+	s.SendMessage(fmt.Sprintf("§aGame mode set to %s", name))
 }
 
 func (s *Session) Disconnect(reason string) {
