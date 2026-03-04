@@ -33,7 +33,6 @@ func DefaultConfig() *Config {
 		ServerPort:   19132,
 		MaxPlayers:   20,
 		MOTD:         "A Frodding Server",
-		MotdProtocol: 0,
 		Console:      ConsoleConfig{Debug: false},
 		Plugins:      PluginsConfig{Folder: "plugins"},
 	}
@@ -44,14 +43,17 @@ func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			_ = SaveConfig(path, cfg)
-			fmt.Println("[Frodding] Created default server.yml")
+			if saveErr := SaveConfig(path, cfg); saveErr != nil {
+				fmt.Printf("[Frodding] Warning: could not save default config: %v\n", saveErr)
+			} else {
+				fmt.Println("[Frodding] Created default server.yml")
+			}
 			return cfg, nil
 		}
-		return cfg, err
+		return nil, err
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
-		return cfg, err
+		return nil, err
 	}
 	return cfg, nil
 }
@@ -61,5 +63,5 @@ func SaveConfig(path string, cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return os.WriteFile(path, data, 0o644)
 }
