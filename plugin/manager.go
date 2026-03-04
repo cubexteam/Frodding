@@ -11,31 +11,31 @@ import (
 )
 
 var (
-	loaded  atomic.Bool
-	plugins []*Plugin
+	initialized atomic.Bool
+	plugins     []*Plugin
 )
 
 func Add(impl Impl) {
-	if loaded.Load() {
+	if initialized.Load() {
 		panic("cannot add plugin after server has started")
 	}
 	plugins = append(plugins, &Plugin{impl: impl})
 }
 
 func Initialize(log Logger, folder string) (func(context.Context) *sync.WaitGroup, error) {
-	if !loaded.CompareAndSwap(false, true) {
+	if !initialized.CompareAndSwap(false, true) {
 		panic("plugins already initialized")
 	}
 
 	log.Infof("Loading %d plugin(s)...", len(plugins))
 
-	names := map[string]struct{}{}
+	seen := make(map[string]struct{}, len(plugins))
 	for _, p := range plugins {
 		key := strings.ToLower(p.impl.Name())
-		if _, ok := names[key]; ok {
+		if _, dup := seen[key]; dup {
 			return nil, fmt.Errorf("duplicate plugin name: %s", p.impl.Name())
 		}
-		names[key] = struct{}{}
+		seen[key] = struct{}{}
 	}
 
 	wd, err := os.Getwd()
@@ -47,20 +47,20 @@ func Initialize(log Logger, folder string) (func(context.Context) *sync.WaitGrou
 		p.logger = log
 		p.directory = filepath.Join(wd, folder, p.impl.Name())
 		if err := p.impl.Setup(p); err != nil {
-			return nil, fmt.Errorf("plugin '%s' setup failed: %w", p.impl.Name(), err)
+			return nil, fmt.Errorf("plugin %q setup failed: %w", p.impl.Name(), err)
 		}
-		log.Infof("Plugin '%s' loaded.", p.impl.Name())
+		log.Infof("Plugin %q loaded.", p.impl.Name())
 	}
 
 	return func(ctx context.Context) *sync.WaitGroup {
-		wg := &sync.WaitGroup{}
+		var wg sync.WaitGroup
+		wg.Add(len(plugins))
 		for _, p := range plugins {
-			wg.Add(1)
 			go func(p *Plugin) {
 				defer wg.Done()
 				p.impl.Run(ctx, p)
 			}(p)
 		}
-		return wg
+		return &wg
 	}, nil
 }
