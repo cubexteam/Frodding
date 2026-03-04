@@ -47,12 +47,12 @@ func (s *Server) Start(ip string, port int) error {
 func (s *Server) Shutdown() {
 	s.running = false
 	if s.conn != nil {
-		s.conn.Close()
+		_ = s.conn.Close()
 	}
 }
 
 func (s *Server) readLoop() {
-	buf := make([]byte, 2048)
+	buf := make([]byte, MaxMTU+100)
 	for s.running {
 		n, addr, err := s.conn.ReadFromUDP(buf)
 		if err != nil {
@@ -63,10 +63,7 @@ func (s *Server) readLoop() {
 		}
 		data := make([]byte, n)
 		copy(data, buf[:n])
-		go func(a *net.UDPAddr, d []byte) {
-			defer func() { recover() }()
-			s.handlePacket(a, d)
-		}(addr, data)
+		go s.handlePacket(addr, data)
 	}
 }
 
@@ -111,7 +108,7 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 			return
 		}
 		pong := BuildUnconnectedPong(ts, s.guid, s.motdFunc())
-		s.conn.WriteToUDP(pong, addr)
+		_, _ = s.conn.WriteToUDP(pong, addr)
 
 	case id == 0x05:
 		proto, mtu, ok := ParseOCR1(data)
@@ -121,7 +118,7 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 		if mtu > MaxMTU {
 			mtu = MaxMTU
 		}
-		s.conn.WriteToUDP(BuildOpenConnectionReply1(s.guid, mtu), addr)
+		_, _ = s.conn.WriteToUDP(BuildOpenConnectionReply1(s.guid, mtu), addr)
 
 	case id == 0x07:
 		clientGUID, _, mtu, ok := ParseOCR2(data)
@@ -140,7 +137,7 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 		sess := NewSession(s.conn, addr, clientGUID, mtu)
 		s.sessions[key] = sess
 		s.mu.Unlock()
-		s.conn.WriteToUDP(BuildOpenConnectionReply2(s.guid, *addr, mtu), addr)
+		_, _ = s.conn.WriteToUDP(BuildOpenConnectionReply2(s.guid, *addr, mtu), addr)
 
 	case id >= 0x80 && id <= 0x8f:
 		sess := s.getSession(addr)
@@ -150,14 +147,12 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 		s.handleDatagram(sess, data)
 
 	case id == 0xc0:
-		sess := s.getSession(addr)
-		if sess != nil {
+		if sess := s.getSession(addr); sess != nil {
 			sess.HandleACK(data)
 		}
 
 	case id == 0xa0:
-		sess := s.getSession(addr)
-		if sess != nil {
+		if sess := s.getSession(addr); sess != nil {
 			sess.HandleNACK(data)
 		}
 	}
@@ -172,16 +167,16 @@ func (s *Server) handleDatagram(sess *Session, data []byte) {
 	sess.mu.Lock()
 	sess.lastRecv = time.Now()
 
-	if sess.recvSeqs[dg.SeqNum] {
+	if _, seen := sess.recvSeqs[dg.SeqNum]; seen {
 		sess.mu.Unlock()
 		return
 	}
-	sess.recvSeqs[dg.SeqNum] = true
+	sess.recvSeqs[dg.SeqNum] = struct{}{}
 	sess.pendingACK = append(sess.pendingACK, dg.SeqNum)
 
 	if dg.SeqNum > sess.recvSeq+1 {
 		for n := sess.recvSeq + 1; n < dg.SeqNum; n++ {
-			if !sess.recvSeqs[n] {
+			if _, seen := sess.recvSeqs[n]; !seen {
 				sess.pendingNACK = append(sess.pendingNACK, n)
 			}
 		}
@@ -201,29 +196,27 @@ func (s *Server) handleFrame(sess *Session, f *Frame) {
 		sess.mu.Lock()
 		buf, ok := sess.splitMap[f.SplitID]
 		if !ok {
-			buf = &splitBuf{count: f.SplitCount, parts: make(map[uint32][]byte)}
+			buf = &splitBuf{count: f.SplitCount, parts: make(map[uint32][]byte, f.SplitCount)}
 			sess.splitMap[f.SplitID] = buf
 		}
 		buf.parts[f.SplitIndex] = f.Payload
-		assembled := false
-		var full []byte
+		var assembled []byte
 		if uint32(len(buf.parts)) >= buf.count {
+			assembled = make([]byte, 0, int(buf.count)*len(f.Payload))
 			for i := uint32(0); i < buf.count; i++ {
-				full = append(full, buf.parts[i]...)
+				assembled = append(assembled, buf.parts[i]...)
 			}
 			delete(sess.splitMap, f.SplitID)
-			assembled = true
 		}
 		sess.mu.Unlock()
-		if assembled {
-			combined := &Frame{
+		if assembled != nil {
+			s.handleFrame(sess, &Frame{
 				Reliability:  f.Reliability,
 				MessageIndex: f.MessageIndex,
 				OrderIndex:   f.OrderIndex,
 				OrderChannel: f.OrderChannel,
-				Payload:      full,
-			}
-			s.handleFrame(sess, combined)
+				Payload:      assembled,
+			})
 		}
 		return
 	}
@@ -268,47 +261,40 @@ func (s *Server) dispatch(sess *Session, payload []byte) {
 	}
 	id := payload[0]
 
-	if id == 0x09 {
+	switch id {
+	case 0x09:
 		_, timestamp, ok := ParseConnectionRequest(payload)
 		if !ok {
 			return
 		}
 		accepted := BuildConnectionRequestAccepted(*sess.Addr, timestamp, sess.Timestamp())
 		sess.Send(accepted, ReliableOrdered, 0)
-		return
-	}
 
-	if id == 0x13 {
+	case 0x13:
 		sess.SetConnected()
 		if s.handler != nil {
 			s.handler.OnConnect(sess)
 		}
-		return
-	}
 
-	if id == 0x15 {
+	case 0x15:
 		s.removeSession(sess)
 		if s.handler != nil {
 			s.handler.OnDisconnect(sess)
 		}
-		return
-	}
 
-	if id == 0x00 {
+	case 0x00:
 		t, ok := ParseConnectedPing(payload)
 		if ok {
-			pong := BuildConnectedPong(t, sess.Timestamp())
-			sess.Send(pong, Unreliable, 0)
+			sess.Send(BuildConnectedPong(t, sess.Timestamp()), Unreliable, 0)
 		}
-		return
-	}
 
-	if !sess.IsConnected() {
-		return
-	}
-
-	if s.handler != nil {
-		s.handler.OnPacket(sess, payload)
+	default:
+		if !sess.IsConnected() {
+			return
+		}
+		if s.handler != nil {
+			s.handler.OnPacket(sess, payload)
+		}
 	}
 }
 
