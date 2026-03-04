@@ -47,3 +47,4 @@ func (r Reliability) IsOrdered() bool {
 
 func (r Reliability) IsSequenced() bool {
 	return r == UnreliableSequenced || r == ReliableSequenced
+}
