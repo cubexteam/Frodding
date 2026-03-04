@@ -12,13 +12,6 @@ type Impl interface {
 	Run(ctx context.Context, p *Plugin)
 }
 
-type Plugin struct {
-	impl             Impl
-	logger           Logger
-	directory        string
-	directoryCreated bool
-}
-
 type Logger interface {
 	Infof(format string, args ...any)
 	Warnf(format string, args ...any)
@@ -26,15 +19,24 @@ type Logger interface {
 	Debugf(format string, args ...any)
 }
 
-func (p *Plugin) Impl() Impl      { return p.impl }
-func (p *Plugin) Logger() Logger  { return p.logger }
+type Plugin struct {
+	impl      Impl
+	logger    Logger
+	directory string
+	dirOnce   struct {
+		done bool
+	}
+}
+
+func (p *Plugin) Impl() Impl     { return p.impl }
+func (p *Plugin) Logger() Logger { return p.logger }
 
 func (p *Plugin) DataFolder() string {
-	if !p.directoryCreated {
-		if err := os.MkdirAll(p.directory, os.ModePerm); err != nil {
-			panic(fmt.Sprintf("failed to create data folder for plugin %s: %v", p.impl.Name(), err))
+	if !p.dirOnce.done {
+		if err := os.MkdirAll(p.directory, 0o755); err != nil {
+			panic(fmt.Sprintf("plugin %s: failed to create data folder: %v", p.impl.Name(), err))
 		}
-		p.directoryCreated = true
+		p.dirOnce.done = true
 	}
 	return p.directory
 }
