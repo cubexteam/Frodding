@@ -26,17 +26,17 @@ type Session struct {
 	sendSeq  uint32
 	recvSeq  uint32
 	msgIndex uint32
+	splitSeq uint16
 
 	orderIndex  [MaxChannels]uint32
 	orderNext   [MaxChannels]uint32
 	orderQueues [MaxChannels]map[uint32][]byte
 
-	recvSeqs    map[uint32]bool
-	pendingACK  []uint32
+	recvSeqs   map[uint32]struct{}
+	pendingACK []uint32
 	pendingNACK []uint32
 
 	splitMap    map[uint16]*splitBuf
-
 	recoveryMap map[uint32]*Datagram
 
 	lastRecv time.Time
@@ -55,12 +55,12 @@ func NewSession(conn *net.UDPConn, addr *net.UDPAddr, guid int64, mtu uint16) *S
 		GUID:        guid,
 		MTU:         mtu,
 		state:       StateHandshaking,
-		recvSeqs:    make(map[uint32]bool),
+		recvSeqs:    make(map[uint32]struct{}),
 		splitMap:    make(map[uint16]*splitBuf),
 		recoveryMap: make(map[uint32]*Datagram),
 		lastRecv:    time.Now(),
 	}
-	for i := 0; i < MaxChannels; i++ {
+	for i := range s.orderQueues {
 		s.orderQueues[i] = make(map[uint32][]byte)
 	}
 	return s
@@ -110,12 +110,15 @@ func (s *Session) HandleNACK(data []byte) {
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	toResend := make([]*Datagram, 0, len(nums))
 	for _, n := range nums {
-		dg, ok := s.recoveryMap[n]
-		if ok {
-			s.conn.WriteToUDP(dg.Encode(), s.Addr)
+		if dg, ok := s.recoveryMap[n]; ok {
+			toResend = append(toResend, dg)
 		}
+	}
+	s.mu.Unlock()
+	for _, dg := range toResend {
+		_, _ = s.conn.WriteToUDP(dg.Encode(), s.Addr)
 	}
 }
 
@@ -128,10 +131,10 @@ func (s *Session) FlushACKs() {
 	s.mu.Unlock()
 
 	if len(acks) > 0 {
-		s.conn.WriteToUDP(EncodeACK(acks), s.Addr)
+		_, _ = s.conn.WriteToUDP(EncodeACK(acks), s.Addr)
 	}
 	if len(nacks) > 0 {
-		s.conn.WriteToUDP(EncodeNACK(nacks), s.Addr)
+		_, _ = s.conn.WriteToUDP(EncodeNACK(nacks), s.Addr)
 	}
 }
 
@@ -165,7 +168,8 @@ func (s *Session) Send(payload []byte, reliability Reliability, orderChannel byt
 		return
 	}
 
-	splitID := s.splitID()
+	splitID := s.splitSeq
+	s.splitSeq++
 	count := (len(payload) + maxPayload - 1) / maxPayload
 	orderIdx := s.orderIndex[orderChannel]
 	if reliability.IsOrdered() {
@@ -177,15 +181,16 @@ func (s *Session) Send(payload []byte, reliability Reliability, orderChannel byt
 		if end > len(payload) {
 			end = len(payload)
 		}
+		chunk := make([]byte, end-start)
+		copy(chunk, payload[start:end])
 		f := &Frame{
 			Reliability: reliability,
 			Split:       true,
 			SplitCount:  uint32(count),
 			SplitID:     splitID,
 			SplitIndex:  uint32(i),
-			Payload:     make([]byte, end-start),
+			Payload:     chunk,
 		}
-		copy(f.Payload, payload[start:end])
 		if reliability.IsReliable() {
 			f.MessageIndex = s.msgIndex
 			s.msgIndex++
@@ -198,32 +203,22 @@ func (s *Session) Send(payload []byte, reliability Reliability, orderChannel byt
 	}
 }
 
-func (s *Session) splitID() uint16 {
-	id := uint16(s.msgIndex & 0xffff)
-	return id
-}
-
 func (s *Session) sendDatagram(frames []*Frame) {
 	seq := s.sendSeq
 	s.sendSeq++
 	dg := &Datagram{SeqNum: seq, Frames: frames}
-	pkt := dg.Encode()
-	s.conn.WriteToUDP(pkt, s.Addr)
+	_, _ = s.conn.WriteToUDP(dg.Encode(), s.Addr)
 
-	hasReliable := false
 	for _, f := range frames {
 		if f.Reliability.IsReliable() {
-			hasReliable = true
+			s.recoveryMap[seq] = dg
 			break
 		}
-	}
-	if hasReliable {
-		s.recoveryMap[seq] = dg
 	}
 }
 
 func (s *Session) SendRaw(data []byte) {
-	s.conn.WriteToUDP(data, s.Addr)
+	_, _ = s.conn.WriteToUDP(data, s.Addr)
 }
 
 func (s *Session) TimedOut() bool {
@@ -240,5 +235,5 @@ func (s *Session) Disconnect() {
 	s.mu.Unlock()
 	f := &Frame{Reliability: Unreliable, Payload: []byte{0x15}}
 	dg := &Datagram{SeqNum: seq, Frames: []*Frame{f}}
-	s.conn.WriteToUDP(dg.Encode(), s.Addr)
+	_, _ = s.conn.WriteToUDP(dg.Encode(), s.Addr)
 }
