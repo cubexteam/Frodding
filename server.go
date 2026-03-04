@@ -18,7 +18,7 @@ import (
 const (
 	Name    = "Frodding"
 	Version = "1.0.0"
-	Author  = "SantianDev, bota"
+	Author  = "SantianDev"
 )
 
 type Server struct {
