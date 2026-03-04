@@ -2,6 +2,7 @@ package logger
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"time"
 )
@@ -17,40 +18,38 @@ const (
 
 type Logger struct {
 	debug bool
+	out   io.Writer
+	err   io.Writer
 }
 
 func New(debug bool) *Logger {
-	return &Logger{debug: debug}
+	return &Logger{debug: debug, out: os.Stdout, err: os.Stderr}
 }
 
 func (l *Logger) timestamp() string {
 	return colorGray + time.Now().Format("15:04:05") + colorReset
 }
 
-func (l *Logger) Infof(format string, args ...any) {
-	fmt.Fprintf(os.Stdout, "%s %sINFO%s  %s\n", l.timestamp(), colorCyan, colorReset, fmt.Sprintf(format, args...))
+func (l *Logger) log(w io.Writer, level, color, format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintf(w, "%s %s%s%s %s\n", l.timestamp(), color, level, colorReset, msg)
 }
 
-func (l *Logger) Warnf(format string, args ...any) {
-	fmt.Fprintf(os.Stdout, "%s %sWARN%s  %s\n", l.timestamp(), colorYellow, colorReset, fmt.Sprintf(format, args...))
-}
-
-func (l *Logger) Errorf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "%s %sERROR%s %s\n", l.timestamp(), colorRed, colorReset, fmt.Sprintf(format, args...))
-}
+func (l *Logger) Infof(format string, args ...any)  { l.log(l.out, "INFO ", colorCyan, format, args...) }
+func (l *Logger) Warnf(format string, args ...any)  { l.log(l.out, "WARN ", colorYellow, format, args...) }
+func (l *Logger) Errorf(format string, args ...any) { l.log(l.err, "ERROR", colorRed, format, args...) }
 
 func (l *Logger) Debugf(format string, args ...any) {
-	if !l.debug {
-		return
+	if l.debug {
+		l.log(l.out, "DEBUG", colorGray, format, args...)
 	}
-	fmt.Fprintf(os.Stdout, "%s %sDEBUG%s %s\n", l.timestamp(), colorGray, colorReset, fmt.Sprintf(format, args...))
 }
 
 func (l *Logger) Fatalf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "%s %sFATAL%s %s\n", l.timestamp(), colorRed, colorReset, fmt.Sprintf(format, args...))
+	l.log(l.err, "FATAL", colorRed, format, args...)
 	os.Exit(1)
 }
 
 func (l *Logger) Chat(name, message string) {
-	fmt.Fprintf(os.Stdout, "%s %sCHAT%s  <%s> %s\n", l.timestamp(), colorWhite, colorReset, name, message)
+	fmt.Fprintf(l.out, "%s %sCHAT %s<%s> %s\n", l.timestamp(), colorWhite, colorReset, name, message)
 }
