@@ -23,68 +23,82 @@ func NewFullChunkDataPacket(cx, cz int32, data []byte) *FullChunkDataPacket {
 	}
 }
 
-func BuildFlatChunk() []byte {
-	buf := &bytes.Buffer{}
+const (
+	numSubChunks  = 8
+	chunkHeight   = numSubChunks * 16
+	blockBedrock  = 7
+	blockStone    = 1
+	blockDirt     = 3
+	blockGrass    = 2
+	surfaceLevel  = 63
+	dirtLevel     = 62
+)
 
-	const numSubChunks = 8
+var flatChunkCache []byte
+
+func BuildFlatChunk() []byte {
+	if flatChunkCache != nil {
+		result := make([]byte, len(flatChunkCache))
+		copy(result, flatChunkCache)
+		return result
+	}
+
+	const blocksPerSub = 4096
+	const nibbleSize = 2048
+
+	buf := &bytes.Buffer{}
+	buf.Grow(1 + numSubChunks*(1+blocksPerSub+nibbleSize*3) + 256 + 256 + 2)
+
 	buf.WriteByte(numSubChunks)
 
 	for sc := 0; sc < numSubChunks; sc++ {
 		buf.WriteByte(0)
-
-		blocks := make([]byte, 4096)
 		baseY := sc * 16
 
+		blocks := make([]byte, blocksPerSub)
 		for x := 0; x < 16; x++ {
 			for z := 0; z < 16; z++ {
 				for y := 0; y < 16; y++ {
 					absY := baseY + y
 					idx := x*256 + z*16 + y
-					if absY == 0 {
-						blocks[idx] = 7
-					} else if absY < 62 {
-						blocks[idx] = 1
-					} else if absY == 62 {
-						blocks[idx] = 3
-					} else if absY == 63 {
-						blocks[idx] = 2
+					switch {
+					case absY == 0:
+						blocks[idx] = blockBedrock
+					case absY < dirtLevel:
+						blocks[idx] = blockStone
+					case absY == dirtLevel:
+						blocks[idx] = blockDirt
+					case absY == surfaceLevel:
+						blocks[idx] = blockGrass
 					}
 				}
 			}
 		}
 		buf.Write(blocks)
+		buf.Write(make([]byte, nibbleSize))
 
-		buf.Write(make([]byte, 2048))
-
-		skylight := make([]byte, 2048)
-		for i := range skylight {
-			if baseY >= 64 {
+		skylight := make([]byte, nibbleSize)
+		if baseY >= chunkHeight/2 {
+			for i := range skylight {
 				skylight[i] = 0xFF
-			} else {
-				skylight[i] = 0x00
 			}
 		}
 		buf.Write(skylight)
-
-		buf.Write(make([]byte, 2048))
+		buf.Write(make([]byte, nibbleSize))
 	}
 
-	heightmap := make([]byte, 256)
-	for i := range heightmap {
-		heightmap[i] = 64
-	}
+	heightmap := bytes.Repeat([]byte{64}, 256)
 	buf.Write(heightmap)
 
-	biomes := make([]byte, 256)
-	for i := range biomes {
-		biomes[i] = 1
-	}
+	biomes := bytes.Repeat([]byte{1}, 256)
 	buf.Write(biomes)
 
-	buf.WriteByte(0)
-	buf.WriteByte(0)
+	buf.Write([]byte{0, 0})
 
-	return buf.Bytes()
+	flatChunkCache = buf.Bytes()
+	result := make([]byte, len(flatChunkCache))
+	copy(result, flatChunkCache)
+	return result
 }
 
 func (pk *FullChunkDataPacket) Encode() {
